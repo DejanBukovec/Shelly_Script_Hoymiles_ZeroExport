@@ -1,0 +1,588 @@
+print('Solar Zero Export - Starting');
+ 
+let author = "Dejan Bukovec";
+let version = "1.00"; 
+ 
+let CONFIG = {
+  DEBUG: false,
+  // Must be < LOOP_INTERVAL_IN_SECONDS
+  HTTP_TIMEOUT: 2,
+  
+  // --- defines for Main Grid Power Meter ---
+  MAIN_GRID_USE_SHELLY: false,
+  MAIN_GRID_USE_MQTT: true,
+
+  // --- defines for Shely Main Grid Power Meter ---
+  // Options: Pro1PM or Pro3EM
+  SHELLY_MAIN_GRID: "Pro1PM",
+  // Options: 1 or 2 or 3
+  SHELLY_MAIN_GRID_PHASE: 1,
+  SHELLY_MAIN_GRID_IP: "192.168.1.111",
+  // if you restricted the web login enter your username and password, for Shelly "Generation 2" devices the username is always "admin" (e.g. Shelly pro 3EM)
+  SHELLY_MAIN_GRID_USER: "admin",
+  SHELLY_MAIN_GRID_PASS: "",
+
+  // --- defines for MQTT Main Grid Power Meter ---
+  MQTT_CURRENT_POWER_TOPIC: "house/sensor/house_powermeter_electric_consumption_w_phase_1",
+
+  // polling interval
+  POOL_INTERVAL_IN_SECONDS: 5, 
+
+  // defines how often a identical limit will be set, set it to "-1" for disabled (infinite repeat)
+  SET_LIMIT_RETRY: 2,
+  // POWERMETER_TARGET_POINT is the target power for powermeter in watts
+  POWERMETER_TARGET_POINT: -75,
+  // POWERMETER_TOLERANCE is the tolerance (pos and neg) around the target point. in this range no adjustment will be set
+  POWERMETER_TOLERANCE: 50,
+  // POWERMETER_MAX_POINT is the maximum power of your powermeter for the normal "regulation loop".
+  // if your powermeter jumps over this point, the limit will be increased instantly. it is like a "super high priority limit change".
+  POWERMETER_MAX_POINT: 0,
+  // POWERMETER_MIN_POINT is the minimum power of your powermeter for the normal "regulation loop".
+  // if your powermeter jumps under this point, the limit will be decreased instantly. it is like a "super high priority limit change".
+  POWERMETER_MIN_POINT: -300,
+};
+
+let INVERTERS = [ {
+    // power rating of your inverter
+    HOY_MAX_WATT: 800,
+    // default power when no powermeter communication availible
+    HOY_DEFAULT_WATT: 200,
+    // minimum limit in percent, e.g. 5%
+    HOY_MIN_WATT_IN_PERCENT: 5,
+	// --- defines for AHOY-DTU ---
+	// in settings/inverter set interval to 6 seconds!
+	DTU_IP: "192.168.1.122",
+	DTU_INVERTER_INDEX: 0,
+  },
+  {
+    // power rating of your inverter
+    HOY_MAX_WATT: 800,
+    // default power when no powermeter communication availible
+    HOY_DEFAULT_WATT: 200,
+    // minimum limit in percent, e.g. 5%
+    HOY_MIN_WATT_IN_PERCENT: 5,
+	// --- defines for AHOY-DTU ---
+	// in settings/inverter set interval to 6 seconds!
+	DTU_IP: "192.168.1.122",
+	DTU_INVERTER_INDEX: 1,
+  },
+  {
+    // power rating of your inverter
+    HOY_MAX_WATT: 800,
+    // default power when no powermeter communication availible
+    HOY_DEFAULT_WATT: 200,
+    // minimum limit in percent, e.g. 5%
+    HOY_MIN_WATT_IN_PERCENT: 5,
+	// --- defines for AHOY-DTU ---
+	// in settings/inverter set interval to 6 seconds!
+	DTU_IP: "192.168.1.122",
+	DTU_INVERTER_INDEX: 2,
+  }
+];
+
+// DO NOT CHANGE AFTER THIS LINE !!!
+print('Solar Zero Export - Author:', author, ' Script Version: ', version);
+
+let SERIAL_NUMBER = [];
+let NAME = [];
+let TEMPERATURE = [];
+let HOY_MAX_WATT = [];
+let HOY_INVERTER_WATT = [];
+let HOY_MIN_WATT = [];
+let CURRENT_LIMIT = [];
+let AVAILABLE = [];
+let PRODUCING = [];
+let HOY_POWER_STATUS = [];
+let ACTUAL_POWER = [];
+let TEMPERATURE_INDEX = [];
+let P_AC_INDEX = [];
+let INTERMEDIATE_METER_WATTS = 0;
+let MAIN_GRID_METER_WATTS = -999999;
+
+print('Solar Zero Export - Parameter Init ...');
+
+if (CONFIG.POWERMETER_MAX_POINT < (CONFIG.POWERMETER_TARGET_POINT + CONFIG.POWERMETER_TOLERANCE)) {
+  CONFIG.POWERMETER_MAX_POINT = CONFIG.POWERMETER_TARGET_POINT + CONFIG.POWERMETER_TOLERANCE + 50;
+  print('Warning: POWERMETER_MAX_POINT < POWERMETER_TARGET_POINT + POWERMETER_TOLERANCE. Setting POWERMETER_MAX_POINT to ', CONFIG.POWERMETER_MAX_POINT);
+}
+
+let MaxWattFromAllInverters = 0;
+
+for(let i = 0; i < INVERTERS.length; i++) {
+  SERIAL_NUMBER.push('yet unknown');
+  NAME.push('yet unknown');
+  TEMPERATURE.push('--- degC');
+  HOY_MAX_WATT.push(INVERTERS[i].HOY_MAX_WATT);
+  HOY_INVERTER_WATT.push(HOY_MAX_WATT[i]);
+  HOY_MIN_WATT.push(HOY_MAX_WATT[i] * INVERTERS[i].HOY_MIN_WATT_IN_PERCENT / 100);
+  CURRENT_LIMIT.push(0);
+  AVAILABLE.push(false);
+  PRODUCING.push(false);
+  HOY_POWER_STATUS.push(true);
+  TEMPERATURE_INDEX.push(0);
+  P_AC_INDEX.push(0);
+}
+
+let newLimitSetpoint = 0;
+let PreviousLimitSetpoint = 0;
+let Limit = {
+  LastLimit: 0,
+  SameLimitCnt: 0,  
+};
+
+print('Solar Zero Export - Parameter Init Completed');
+
+print('Solar Zero Export - Device Information');
+
+let device_info=Shelly.getDeviceInfo();
+print('Solar Zero Export - Model: ', device_info.app);
+print('Solar Zero Export - Firmware: ', device_info.fw_id);
+print('Solar Zero Export - MAC: ', device_info.mac);
+
+let HTTP_REQUESTS = {
+  POOL_DELAY_COUNT: 0,
+  RETRY_COUNT: 0,
+  SOLAR_WATTS: 0,
+  MAIN_GRID_WATTS: 0,
+  AHOY_SET_LIMIT: 0,
+  AHOY_API_INDEX: 0,
+  AHOY_API_LIVE: 0,
+  AHOY_API_INVERTER: 0,
+};
+
+function GetMaxWattFromAllInverters() {
+  MaxWattFromAllInverters = 0;
+  
+  for(let i = 0; i < INVERTERS.length; i++) {
+	if (AVAILABLE[i] && PRODUCING[i]) {
+      MaxWattFromAllInverters+=HOY_MAX_WATT[i];
+	}
+  }
+}
+
+// Power Meter Requests
+
+function GetSolarWatts() {
+  HTTP_REQUESTS.SOLAR_WATTS = 1;
+  
+  let status = Shelly.getComponentStatus("switch", 0);
+  INTERMEDIATE_METER_WATTS = Math. abs(Math.round(status.apower));
+  if (CONFIG.DEBUG) {
+    print('Solar Zero Export - Max Watt From All Inverters: ', MaxWattFromAllInverters, ' Watts');
+  }
+  HTTP_REQUESTS.SOLAR_WATTS = 2;
+}
+
+function processShellyMainGridWattsResponse(response, error_code, error_message) {
+  if (error_code !== 0) {
+    print('Solar Zero Export - Main Grid meter Shelly ', CONFIG.SHELLY_MAIN_GRID, ' Error: ', error_message);
+    MAIN_GRID_METER_WATTS = -999999;    
+    HTTP_REQUESTS.MAIN_GRID_WATTS = -1;    
+    return;
+  }
+  
+  let ParsedData = JSON.parse(response.body);
+  
+  if (CONFIG.SHELLY_MAIN_GRID === "Pro1PM") {
+    MAIN_GRID_METER_WATTS = Math.round(JSON.parse(JSON.stringify(ParsedData.apower)));
+  }
+  else if (CONFIG.SHELLY_MAIN_GRID === "Pro3EM") {
+    if (CONFIG.SHELLY_MAIN_GRID_PHASE === 1) {
+      MAIN_GRID_METER_WATTS = Math.round(JSON.parse(JSON.stringify(ParsedData.a_act_power)));
+    }
+    else if (CONFIG.SHELLY_MAIN_GRID_PHASE === 2) {
+      MAIN_GRID_METER_WATTS = Math.round(JSON.parse(JSON.stringify(ParsedData.b_act_power)));
+    }
+    else if (CONFIG.SHELLY_MAIN_GRID_PHASE === 3) {
+      MAIN_GRID_METER_WATTS = Math.round(JSON.parse(JSON.stringify(ParsedData.c_act_power)));
+    }
+  }
+  if (CONFIG.DEBUG) {    
+    print('Solar Zero Export - Main Grid meter Shelly ', CONFIG.SHELLY_MAIN_GRID, ': ', MAIN_GRID_METER_WATTS , ' Watts');
+  }
+  HTTP_REQUESTS.MAIN_GRID_WATTS = 2;
+}
+
+function GetMainGridWatts() {
+  HTTP_REQUESTS.MAIN_GRID_WATTS = 1;
+  let url = "";
+  
+  if (CONFIG.MAIN_GRID_USE_SHELLY) {
+    if (CONFIG.SHELLY_MAIN_GRID === "Pro1PM") {
+      url = "http://" + CONFIG.SHELLY_MAIN_GRID_IP + "/rpc/Switch.GetStatus?id=0";
+    }
+    else if (CONFIG.SHELLY_MAIN_GRID === "Pro3EM") {
+      url = "http://" + CONFIG.SHELLY_MAIN_GRID_IP + "/rpc/EM.GetStatus?id=0";
+    }
+    
+    Shelly.call("HTTP.GET", {"url": url, "timeout": CONFIG.HTTP_TIMEOUT}, processShellyMainGridWattsResponse);
+  }  
+  else
+  {
+    HTTP_REQUESTS.MAIN_GRID_WATTS = 2;
+  }  
+}
+
+function MQTTGridPowerMeterListener(topic, message) {
+  if(topic === CONFIG.MQTT_CURRENT_POWER_TOPIC) {
+    MAIN_GRID_METER_WATTS = Math.round(JSON.parse(message));
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - Main Grid meter MQTT: ', CONFIG.MQTT_CURRENT_POWER_TOPIC, ': ', MAIN_GRID_METER_WATTS , ' Watts');
+    }
+  }
+}
+
+// DTU Requests
+
+let SET_LIMIT_COUNT = 0;
+
+function processAhoySetLimitResponse(response, error_code, error_message, pInverterId) {
+  if (error_code !== 0) {
+    print('Solar Zero Export - Ahoy: API Set Limit Inverter ID: ', JSON.stringify(pInverterId), ' Error: ', error_message);
+
+    HTTP_REQUESTS.AHOY_SET_LIMIT= -1;    
+    return;
+  }
+
+  let ParsedData = JSON.parse(response.body);
+
+  if (CONFIG.DEBUG) {
+    print('Solar Zero Export - Ahoy: API Set Limit"', NAME[pInverterId], '" Success: ', ParsedData.success);
+  }
+  if (HTTP_REQUESTS.AHOY_SET_LIMIT!== -1) {
+    HTTP_REQUESTS.AHOY_SET_LIMIT++;
+  }
+}
+
+function SetLimitAhoy(pInverterId, pLimit) {
+  let url = "http://" + INVERTERS[pInverterId].DTU_IP + "/api/ctrl";
+  let data = {"id": JSON.stringify(INVERTERS[pInverterId].DTU_INVERTER_INDEX), "cmd": "limit_nonpersistent_absolute", "val": pLimit};
+  let headers = {'Content-type': 'application/json', 'Accept': 'text/plain'};
+  print('Solar Zero Export - Ahoy: Inverter "', NAME[pInverterId], '": setting new limit from ', INVERTERS[pInverterId].CURRENT_LIMIT, ' Watt to ', pLimit, ' Watt');
+  Shelly.call("HTTP.POST", {"url": url, "content_type": headers, "body": data, "timeout": CONFIG.HTTP_TIMEOUT}, processAhoySetLimitResponse, pInverterId);
+  INVERTERS[pInverterId].CURRENT_LIMIT = pLimit;
+}
+
+function processAhoyApiIndexResponse(response, error_code, error_message, pInverterId) {
+  if (error_code !== 0) {
+    print('Solar Zero Export - Ahoy: API Index Inverter "', NAME[pInverterId], '" Error: ', error_message);
+    
+    AVAILABLE[pInverterId] = false;
+	PRODUCING[pInverterId] = false;
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - Ahoy: API Index Inverter "', NAME[pInverterId], '" reachable: ', AVAILABLE[pInverterId]);
+    }       
+       
+    HTTP_REQUESTS.AHOY_API_INDEX = -1;    
+    return;
+  }
+  
+  let ParsedData = JSON.parse(response.body);
+  
+  let InvName = ParsedData.inverter[INVERTERS[pInverterId].DTU_INVERTER_INDEX].name;
+  NAME[pInverterId] = InvName;
+  
+  let Reachable = ParsedData.inverter[INVERTERS[pInverterId].DTU_INVERTER_INDEX].is_avail;
+  AVAILABLE[pInverterId] = Reachable;
+  
+  let Producing = ParsedData.inverter[INVERTERS[pInverterId].DTU_INVERTER_INDEX].is_producing;
+  PRODUCING[pInverterId] = Producing;
+  
+  if (CONFIG.DEBUG) {
+    print('Solar Zero Export - Ahoy: API Index Inverter "', NAME[pInverterId], '" reachable: ', Reachable, ' producing: ', Producing);
+  }
+  
+  if (HTTP_REQUESTS.AHOY_API_INDEX !== -1) {
+    HTTP_REQUESTS.AHOY_API_INDEX++;
+  }
+}
+
+function GetAhoyApiIndex() {
+  HTTP_REQUESTS.AHOY_API_INDEX = 1;
+  for(let i = 0; i < INVERTERS.length; i++) {
+	let url = "http://" + INVERTERS[i].DTU_IP + "/api/index";
+	Shelly.call("HTTP.GET", {"url": url, "timeout": CONFIG.HTTP_TIMEOUT}, processAhoyApiIndexResponse, i);
+  }	
+}
+
+function processAhoyApiLiveResponse(response, error_code, error_message, pInverterId) {
+  if (error_code !== 0) {
+    print('Solar Zero Export - Ahoy: API Live Inverter ID: ' , JSON.stringify(pInverterId), ' Error: ', error_message);   
+       
+    HTTP_REQUESTS.AHOY_API_LIVE = -1;    
+    return;
+  }
+  
+  let ParsedData = JSON.parse(response.body);
+  
+  for (let field_index in ParsedData.ch0_fld_names) {
+    if (ParsedData.ch0_fld_names[field_index] === "Temp") {
+      TEMPERATURE_INDEX[pInverterId] = field_index;
+    }
+    if (ParsedData.ch0_fld_names[field_index] === "P_AC") {
+      P_AC_INDEX[pInverterId] = field_index;     
+    }
+  }
+  
+  if (HTTP_REQUESTS.AHOY_API_LIVE !== -1) {
+    HTTP_REQUESTS.AHOY_API_LIVE++;
+  }
+}
+
+function GetAhoyApiLive() {
+  HTTP_REQUESTS.AHOY_API_LIVE = 1;
+  for(let i = 0; i < INVERTERS.length; i++) {
+	let url = "http://" + INVERTERS[i].DTU_IP + "/api/live";  
+	Shelly.call("HTTP.GET", {"url": url, "timeout": CONFIG.HTTP_TIMEOUT}, processAhoyApiLiveResponse, i);
+  }
+}
+
+function processAhoyApiInverterResponse(response, error_code, error_message, pInverterId) {
+  if (error_code !== 0) {
+    print('Solar Zero Export - Ahoy: API Inverter ID: ', JSON.stringify(pInverterId), ' Error: ', error_message);
+    ACTUAL_POWER[pInverterId] = -999999;   
+       
+    HTTP_REQUESTS.AHOY_API_INVERTER = -1;    
+    return;
+  }
+
+  let ParsedData = JSON.parse(response.body);
+  SERIAL_NUMBER[pInverterId] = ParsedData.serial;
+  NAME[pInverterId] = ParsedData.name;
+  TEMPERATURE[pInverterId] = JSON.stringify(Math.round(JSON.parse(JSON.stringify(ParsedData.ch[0][TEMPERATURE_INDEX[pInverterId]])))) + ' degC';
+  ACTUAL_POWER[pInverterId] = Math.round(JSON.parse(JSON.stringify(ParsedData.ch[0][P_AC_INDEX[pInverterId]])));
+  
+  if (CONFIG.DEBUG) {
+    print('Solar Zero Export - Ahoy: API Inverter "', NAME[pInverterId], '" SerialNumber: ', SERIAL_NUMBER[pInverterId], ' Temperature: ', TEMPERATURE[pInverterId], "AC Power: ", ACTUAL_POWER[pInverterId], ' W');
+  }
+  if (HTTP_REQUESTS.AHOY_API_INVERTER !== -1) {
+    HTTP_REQUESTS.AHOY_API_INVERTER++;
+  }
+}
+
+function GetAhoyApiInverter() {
+  HTTP_REQUESTS.AHOY_API_INVERTER = 1;
+  for(let i = 0; i < INVERTERS.length; i++) {
+    let url = "http://" + INVERTERS[i].DTU_IP + "/api/inverter/id/" +   JSON.stringify(INVERTERS[i].DTU_INVERTER_INDEX);  
+    Shelly.call("HTTP.GET", {"url": url, "timeout": CONFIG.HTTP_TIMEOUT}, processAhoyApiInverterResponse, i);
+  }
+}
+
+function PoolData() {
+  if (HTTP_REQUESTS.SOLAR_WATTS === 0) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetSolarWatts');
+    }
+    GetSolarWatts();
+  }
+  else if (HTTP_REQUESTS.SOLAR_WATTS === 1) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetSolarWatts Wait');
+    }
+  }
+  else if (HTTP_REQUESTS.SOLAR_WATTS === 2 && HTTP_REQUESTS.MAIN_GRID_WATTS === 0) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetMainGridWatts');
+    }
+    GetMainGridWatts();
+  }
+  else if (HTTP_REQUESTS.MAIN_GRID_WATTS === 1) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetMainGridWatts Wait');
+    }
+  }
+  else if ((HTTP_REQUESTS.MAIN_GRID_WATTS === 2 || HTTP_REQUESTS.MAIN_GRID_WATTS === -1) && HTTP_REQUESTS.AHOY_SET_LIMIT === 0) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: PoolSetLimit');
+    }
+    PoolSetLimit();
+  }
+  else if (HTTP_REQUESTS.AHOY_SET_LIMIT >= 1 && HTTP_REQUESTS.AHOY_SET_LIMIT < INVERTERS.length+1) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: PoolSetLimit Wait');
+    }
+  }
+  else if (HTTP_REQUESTS.AHOY_SET_LIMIT >= INVERTERS.length+1 && HTTP_REQUESTS.AHOY_API_INDEX === 0) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetAhoyApiIndex');
+    }
+    GetAhoyApiIndex();
+  }
+  else if (HTTP_REQUESTS.AHOY_API_INDEX >= 1 && HTTP_REQUESTS.AHOY_API_INDEX < INVERTERS.length+1) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetAhoyApiIndex Wait');
+    }
+  }
+  else if (HTTP_REQUESTS.AHOY_API_INDEX >= INVERTERS.length+1 && HTTP_REQUESTS.AHOY_API_LIVE === 0) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetAhoyApiLive');
+    }
+    GetAhoyApiLive();
+  }
+  else if (HTTP_REQUESTS.AHOY_API_LIVE >= 1 && HTTP_REQUESTS.AHOY_API_LIVE < INVERTERS.length+1) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetAhoyApiLive Wait');
+    }
+  }
+  else if (HTTP_REQUESTS.AHOY_API_LIVE >= INVERTERS.length+1 && HTTP_REQUESTS.AHOY_API_INVERTER === 0) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetAhoyApiInverter');
+    }
+    GetAhoyApiInverter();
+  }
+  else if (HTTP_REQUESTS.AHOY_API_INVERTER >= 1 && HTTP_REQUESTS.AHOY_API_INVERTER < INVERTERS.length+1) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: GetAhoyApiInverter Wait');
+    }
+  }
+  else if (HTTP_REQUESTS.SOLAR_WATTS === -1 || HTTP_REQUESTS.MAIN_GRID_WATTS === -1 || HTTP_REQUESTS.AHOY_API_INDEX === -1 || HTTP_REQUESTS.AHOY_API_LIVE === -1 || HTTP_REQUESTS.AHOY_API_LIVE === -1 || HTTP_REQUESTS.AHOY_SET_LIMIT === -1) {
+    if (CONFIG.DEBUG) {
+      print('Solar Zero Export - PoolData: Failed Retry');
+    }
+    
+    HTTP_REQUESTS.POOL_DELAY_COUNT = 0;
+    HTTP_REQUESTS.RETRY_COUNT++;
+    HTTP_REQUESTS.SOLAR_WATTS = 0;
+    HTTP_REQUESTS.MAIN_GRID_WATTS = 0;
+    HTTP_REQUESTS.AHOY_SET_LIMIT = 0;
+    HTTP_REQUESTS.AHOY_API_INDEX = 0;
+    HTTP_REQUESTS.AHOY_API_LIVE = 0;
+    HTTP_REQUESTS.AHOY_API_INVERTER = 0;
+  }
+  else {
+    if (HTTP_REQUESTS.POOL_DELAY_COUNT*100 < CONFIG.POOL_INTERVAL_IN_SECONDS*1000) {
+      HTTP_REQUESTS.POOL_DELAY_COUNT++;
+      if (CONFIG.DEBUG) {
+        print('Solar Zero Export - PoolData: Delay');
+      }
+      return;    
+    }
+    else {
+      HTTP_REQUESTS.POOL_DELAY_COUNT = 0;
+      HTTP_REQUESTS.RETRY_COUNT = 0;
+      HTTP_REQUESTS.SOLAR_WATTS = 0;
+      HTTP_REQUESTS.MAIN_GRID_WATTS = 0;
+      HTTP_REQUESTS.AHOY_SET_LIMIT = 0;
+      HTTP_REQUESTS.AHOY_API_INDEX = 0;
+      HTTP_REQUESTS.AHOY_API_LIVE = 0;
+      HTTP_REQUESTS.AHOY_API_INVERTER = 0;
+      if (CONFIG.DEBUG) {
+        print('Solar Zero Export - PoolData: Completed');
+      }
+    }
+  }
+}
+
+function SetLimit(pLimit) {
+//  print('Solar Zero Export - SetLimit :', pLimit, ' Watts');
+  if (CONFIG.SET_LIMIT_RETRY !== -1) {
+    if (Limit.LastLimit === pLimit) {
+      Limit.SameLimitCnt = Limit.SameLimitCnt + 1;
+    }
+    else {
+      Limit.LastLimit = pLimit;
+      Limit.SameLimitCnt = 0;
+    }
+    
+    if (Limit.SameLimitCnt >= CONFIG.SET_LIMIT_RETRY) {
+      print('Solar Zero Export - SetLimit Retry Counter exceeded: Inverterlimit already at ', pLimit, ' Watt');
+      HTTP_REQUESTS.AHOY_SET_LIMIT = INVERTERS.length+1;
+      return;
+    }
+  }
+  
+  if (CONFIG.DEBUG) {
+	print('Solar Zero Export - SetLimit Setting new limit to ', pLimit, ' Watt');
+  }
+  
+  for(let i = 0; i < INVERTERS.length; i++) {
+    let Factor = HOY_MAX_WATT[i] / MaxWattFromAllInverters;
+    let NewLimit = Math.round(pLimit*Factor);
+    if (PRODUCING[i]) {
+      SetLimitAhoy(i, NewLimit);
+	}
+	else {
+	  if (HTTP_REQUESTS.AHOY_SET_LIMIT!== -1) {
+        HTTP_REQUESTS.AHOY_SET_LIMIT++;
+      }
+	}
+  }
+}
+
+function PoolSetLimit() {
+  HTTP_REQUESTS.AHOY_SET_LIMIT = 1;
+  
+  PreviousLimitSetpoint = newLimitSetpoint;
+
+  GetMaxWattFromAllInverters();
+
+  let powermeterWatts = MAIN_GRID_METER_WATTS;
+  let hoymilesActualPower = INTERMEDIATE_METER_WATTS; 
+  
+  print('Solar Zero Export - PoolSetLimit powermeterWatts: ', powermeterWatts, ' Watts hoymilesActualPower: ', hoymilesActualPower, ' Watts');  
+    
+  if(powermeterWatts  === -999999) {
+    print('Solar Zero Export - PoolSetLimit: MAIN_GRID_METER ERROR');
+    print('Solar Zero Export - PoolSetLimit: Set Limit to 600W');
+    SetLimit(600);
+  }
+  else if (powermeterWatts > CONFIG.POWERMETER_MAX_POINT) {
+    newLimitSetpoint = hoymilesActualPower + powermeterWatts - CONFIG.POWERMETER_TARGET_POINT;
+    if (newLimitSetpoint > MaxWattFromAllInverters) {
+      newLimitSetpoint = MaxWattFromAllInverters;
+    }    
+    print('Solar Zero Export - PoolSetLimit: powermeterWatts > POWERMETER_MAX_POINT New Limit: ', newLimitSetpoint, ' Watts');
+    SetLimit(newLimitSetpoint);  
+  }
+  else if (powermeterWatts < CONFIG.POWERMETER_MIN_POINT) {
+    newLimitSetpoint = hoymilesActualPower + powermeterWatts - CONFIG.POWERMETER_TARGET_POINT;
+    if (newLimitSetpoint > MaxWattFromAllInverters) {
+      newLimitSetpoint = MaxWattFromAllInverters;
+    } 
+    print('Solar Zero Export - PoolSetLimit: powermeterWatts < POWERMETER_MIN_POINT New Limit: ', newLimitSetpoint, ' Watts');
+    SetLimit(newLimitSetpoint);
+  }
+  // Producing too much power: reduce limit
+  else if (powermeterWatts < (CONFIG.POWERMETER_TARGET_POINT - CONFIG.POWERMETER_TOLERANCE)) {
+    newLimitSetpoint = hoymilesActualPower + powermeterWatts - CONFIG.POWERMETER_TARGET_POINT;
+    if (newLimitSetpoint > MaxWattFromAllInverters) {
+      newLimitSetpoint = MaxWattFromAllInverters;
+    } 
+    print('Solar Zero Export - PoolSetLimit: Overproducing New Limit: ', newLimitSetpoint, ' Watts');  
+    SetLimit(newLimitSetpoint);
+  }
+  // Producing too little power: increase limit
+  else if (powermeterWatts > (CONFIG.POWERMETER_TARGET_POINT + CONFIG.POWERMETER_TOLERANCE)) {
+    if (PreviousLimitSetpoint < MaxWattFromAllInverters) {
+      newLimitSetpoint = hoymilesActualPower + powermeterWatts - CONFIG.POWERMETER_TARGET_POINT;
+      if (newLimitSetpoint > MaxWattFromAllInverters) {
+        newLimitSetpoint = MaxWattFromAllInverters;
+      } 
+      print('Solar Zero Export - PoolSetLimit: Underproducing New Limit: ', newLimitSetpoint, ' Watts'); 
+      SetLimit(newLimitSetpoint);
+    }
+    else {
+      print('Solar Zero Export - PoolSetLimit: Underproducing: limit already at maximum: ', newLimitSetpoint, ' Watts'); 
+      HTTP_REQUESTS.AHOY_SET_LIMIT = INVERTERS.length+1;
+    }
+  }
+  else {
+    HTTP_REQUESTS.AHOY_SET_LIMIT = INVERTERS.length+1;
+  }
+
+  //print('Solar Zero Export - PoolSetLimit: Completed');
+}
+
+let poolDataTimer;
+
+function startPoolDataTimer() {
+  poolDataTimer = Timer.set(100, true, PoolData);
+}
+
+if (CONFIG.MAIN_GRID_USE_MQTT) {
+  MQTT.subscribe(CONFIG.MQTT_CURRENT_POWER_TOPIC, MQTTGridPowerMeterListener);
+}
+
+startPoolDataTimer();
+
+print('Solar Zero Export - Started');

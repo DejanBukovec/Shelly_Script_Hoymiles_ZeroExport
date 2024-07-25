@@ -1,4 +1,4 @@
-This is Shelly script to control ZeroExport on Hoymiles HM/HMS inverters using OpenDTU or AhoyDTU.
+This is Shelly script to control ZeroExport on Hoymiles HM/HMS inverters using AhoyDTU.
 
 
 If you like my work you can donate and support my work...
